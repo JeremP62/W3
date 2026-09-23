@@ -1,4 +1,5 @@
 import asyncio, math, random, sqlite3
+from collections import deque
 import numpy as np
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
@@ -289,6 +290,7 @@ TX_POWER, N = -59, 2.2   # RSSI à 1 m et exposant de perte : À CALIBRER (voir 
 state, clients = {}, set()
 manual_overrides = {}  # {badge_id: (x, y)} - positions forcees pour tester sans BLE
 current_bpm = {}   # {badge_id: bpm simule} - EN ATTENTE d'un vrai capteur biometrique
+bpm_history = {}   # {badge_id: deque des dernieres valeurs, pour la courbe du profil}
 prev_alert = {}    # {badge_id: bool} - detecte les transitions pour ne logger qu'une fois
 
 
@@ -334,6 +336,7 @@ def update_bpm(badge):
     bpm = prev + pull_to_baseline + random.gauss(0, 1.8)
     bpm = max(55, min(bpm, 145))
     current_bpm[badge] = bpm
+    bpm_history.setdefault(badge, deque(maxlen=150)).append(round(bpm))  # ~30s d'historique
     return bpm
 
 
@@ -346,10 +349,13 @@ def snapshot():
             # entierement le calcul RSSI/trilateration
             x, y = manual_overrides[badge]
             smoothed_positions[badge] = np.array([x, y])
+            signal = None          # pas de vrai signal BLE en mode test
+            mode = "test"
         else:
             s = state[badge]
             if len(s) >= 3:
                 raw_x, raw_y = trilaterate({a: rssi_to_dist(r) for a, r in s.items()})
+                mode = "trilateration"
             elif len(s) >= 1:
                 nearest_anchor = max(s, key=s.get)
                 anchor_pos = np.array(ANCHORS[nearest_anchor])
@@ -357,6 +363,7 @@ def snapshot():
                 direction = np.array(ANCHOR_DIRECTIONS[nearest_anchor], dtype=float)
                 direction = direction / (np.linalg.norm(direction) or 1)
                 raw_x, raw_y = anchor_pos + direction * min(dist, 5.5)
+                mode = "1-ancre"
             else:
                 continue
 
@@ -364,6 +371,8 @@ def snapshot():
             smoothed = 0.65 * prev + 0.35 * np.array([raw_x, raw_y])
             smoothed_positions[badge] = smoothed
             x, y = smoothed
+            # RSSI brut par ancre (arrondi), pour affichage cote dashboard
+            signal = {a: round(r) for a, r in s.items()}
         zone = zone_of(x, y)
 
         crew = CREW.get(badge)
@@ -410,6 +419,8 @@ def snapshot():
             "bpm": round(bpm),
             "alert": alert,
             "motif": motif,
+            "signal": signal,   # {"A1": -62, "A2": -70, ...} ou null en mode test
+            "mode": mode,       # "trilateration" | "1-ancre" | "test"
         })
     return out
 
@@ -580,6 +591,13 @@ def list_roles():
     return {"roles": result}
 
 
+@app.get("/profile/{badge}/history")
+def get_bpm_history(badge: str):
+    """Historique recent du BPM d'un badge, pour tracer la courbe dans la
+    fiche de profil du dashboard."""
+    return {"badge": badge, "history": list(bpm_history.get(badge, []))}
+
+
 @app.get("/logs")
 def get_logs(limit: int = 20):
     conn = get_db()
@@ -613,7 +631,7 @@ def test_move(d: dict):
     if room not in ZONES:
         return {"error": f"Salle inconnue. Salles valides : {list(ZONES.keys())}"}
     x1, y1, x2, y2 = ZONES[room]
-    center = ((x1 + x2) / 2, (y1 + y2) / 2)
+    center = (round((x1 + x2) / 2, 2), round((y1 + y2) / 2, 2))
     manual_overrides[badge] = center
     return {"badge": badge, "room": room, "position": center}
 
@@ -624,8 +642,8 @@ def test_set_position(d: dict):
     deplacement libre au clavier (ZQSD) cote frontend.
     Payload : {"badge": "ASTRA-001", "x": 7.2, "y": 3.9}"""
     badge = d["badge"]
-    x = max(0.3, min(float(d["x"]), ROOM_WIDTH_M_SERVER - 0.3))
-    y = max(0.3, min(float(d["y"]), ROOM_HEIGHT_M_SERVER - 0.3))
+    x = round(max(0.3, min(float(d["x"]), ROOM_WIDTH_M_SERVER - 0.3)), 2)
+    y = round(max(0.3, min(float(d["y"]), ROOM_HEIGHT_M_SERVER - 0.3)), 2)
     manual_overrides[badge] = (x, y)
     return {"badge": badge, "position": (x, y)}
 

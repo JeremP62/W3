@@ -2,7 +2,7 @@
 from bleak import BleakScanner
 
 ANCHOR_ID = "A1"                       # A1 pour ce premier test
-SERVER = "http://127.0.0.1:8000"       # meme PC pour l instant
+SERVER = "http://172.20.10.13:8000"      # meme PC pour l instant
 
 async def main():
     async with httpx.AsyncClient() as http:
@@ -18,3 +18,4 @@ async def main():
             await asyncio.Event().wait()
 
 asyncio.run(main())
+
