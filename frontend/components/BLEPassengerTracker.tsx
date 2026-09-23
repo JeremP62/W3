@@ -107,12 +107,16 @@ interface Passenger {
   id: string;      // identifiant BLE (nom annoncé, ex: "ASTRA-002")
   name: string;
   role: string;
+  pilier: string | null;  // pilier de rattachement du role (ex: "Pilier 4 : DeepTech"), null si inconnu
   x: number;        // position en mètres
   y: number;
   zone: string;      // doit correspondre à un des noms de ROOMS, ou "Coursive"
   bpm: number;       // fréquence cardiaque simulée (en attente d'un vrai capteur)
   alert: boolean;   // true si présence non autorisée en zone restreinte
   motif?: string | null;  // raison du refus, si alert=true
+  signal: Record<string, number> | null;  // RSSI brut par ancre (dBm), null en mode test
+  mode: "trilateration" | "1-ancre" | "test";
+  anomaly: boolean;  // saut de position suspect (indice d'usurpation potentielle)
 }
 
 type ConnState = "connecting" | "connected" | "disconnected";
@@ -133,14 +137,18 @@ export default function BLEPassengerTracker() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const roomCanvasRef = useRef<HTMLCanvasElement>(null);
   const [people, setPeople] = useState<Passenger[]>([]);
-  const [selected, setSelected] = useState<Passenger | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [conn, setConn] = useState<ConnState>("connecting");
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null);
   const [intrusion, setIntrusion] = useState<Passenger | null>(null);
   const [logsOpen, setLogsOpen] = useState(false);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [profileOpen, setProfileOpen] = useState(false);
+  const [bpmHistory, setBpmHistory] = useState<number[]>([]);
+  const bpmChartRef = useRef<HTMLCanvasElement>(null);
   const [testBadge, setTestBadge] = useState(TEST_BADGES[0]);
   const [testStatus, setTestStatus] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [rescueResult, setRescueResult] = useState<{ zone: string; trapped: string[]; can_seal: boolean } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const prevAlertRef = useRef<Record<string, boolean>>({});
 
@@ -362,6 +370,17 @@ export default function BLEPassengerTracker() {
         ctx.fillStyle = "rgba(255,50,50,0.25)";
         ctx.fill();
       }
+      if (p.anomaly) {
+        // anneau pointille ambre : saut de position suspect, distinct de l'alerte rouge
+        ctx.save();
+        ctx.setLineDash([4, 3]);
+        ctx.strokeStyle = "#ffb84d";
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.arc(px, py, 18, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
+      }
 
       ctx.beginPath();
       ctx.arc(px, py, 8, 0, Math.PI * 2);
@@ -410,6 +429,22 @@ export default function BLEPassengerTracker() {
     }
   }
 
+  // --- Mode sauvetage : verifie qu'une salle est vide avant scellement ---
+  async function callRescue(zone: string) {
+    setRescueResult(null);
+    try {
+      const res = await fetch(`${HTTP_BASE}/rescue/${encodeURIComponent(zone)}`, { method: "POST" });
+      const data = await res.json();
+      if (data?.error) {
+        setRescueResult({ zone, trapped: [], can_seal: false });
+        return;
+      }
+      setRescueResult(data);
+    } catch {
+      setRescueResult(null);
+    }
+  }
+
   // --- Déplacement libre au clavier (ZQSD) pour le badge en mode test ----
   const walkPosRef = useRef<Record<string, { x: number; y: number }>>({});
 
@@ -430,6 +465,88 @@ export default function BLEPassengerTracker() {
     const interval = setInterval(fetchLogs, 3000);
     return () => clearInterval(interval);
   }, [logsOpen]);
+
+  // --- Fiche de profil : historique BPM + courbe -------------------------
+  async function fetchBpmHistory(badge: string) {
+    try {
+      const res = await fetch(`${HTTP_BASE}/profile/${badge}/history`);
+      const data = await res.json();
+      setBpmHistory(data.history ?? []);
+    } catch {
+      // silencieux : la courbe restera vide si le serveur est injoignable
+    }
+  }
+
+  useEffect(() => {
+    if (!profileOpen || !selectedId) return;
+    fetchBpmHistory(selectedId);
+    const interval = setInterval(() => fetchBpmHistory(selectedId), 1500);
+    return () => clearInterval(interval);
+  }, [profileOpen, selectedId]);
+
+  useEffect(() => {
+    if (!profileOpen) return;
+    const canvas = bpmChartRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    const W = 460, H = 140;
+    canvas.width = W;
+    canvas.height = H;
+    ctx.clearRect(0, 0, W, H);
+
+    // grille de fond
+    ctx.strokeStyle = "rgba(57,255,136,0.08)";
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+      const y = (H / 4) * i;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+
+    if (bpmHistory.length < 2) {
+      ctx.fillStyle = "rgba(215,255,232,0.35)";
+      ctx.font = "12px 'JetBrains Mono', ui-monospace, monospace";
+      ctx.textAlign = "center";
+      ctx.fillText("Collecte des données…", W / 2, H / 2);
+      ctx.textAlign = "left";
+      return;
+    }
+
+    const min = Math.min(...bpmHistory, 50);
+    const max = Math.max(...bpmHistory, 150);
+    const range = max - min || 1;
+    const stepX = W / (bpmHistory.length - 1);
+
+    // seuil de vigilance (repère visuel à 100 bpm)
+    const yAt = (v: number) => H - ((v - min) / range) * (H - 20) - 10;
+    ctx.strokeStyle = "rgba(255,184,77,0.25)";
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(0, yAt(100));
+    ctx.lineTo(W, yAt(100));
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // courbe
+    ctx.strokeStyle = "#39ff88";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    bpmHistory.forEach((v, i) => {
+      const x = i * stepX;
+      const y = yAt(v);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // point final mis en évidence
+    const lastX = (bpmHistory.length - 1) * stepX;
+    const lastY = yAt(bpmHistory[bpmHistory.length - 1]);
+    ctx.fillStyle = "#39ff88";
+    ctx.beginPath();
+    ctx.arc(lastX, lastY, 3, 0, Math.PI * 2);
+    ctx.fill();
+  }, [bpmHistory, profileOpen]);
 
   useEffect(() => {
     const STEP = 0.3;
@@ -487,7 +604,7 @@ export default function BLEPassengerTracker() {
       }
     }
     if (minDist < 20) {
-      setSelected(closest);
+      setSelectedId(closest?.id ?? null);
       return;
     }
 
@@ -496,7 +613,7 @@ export default function BLEPassengerTracker() {
     const room = ROOMS.find((r) => mx >= r.x1 && mx <= r.x2 && my >= r.y1 && my <= r.y2);
     if (room) {
       setSelectedRoom(room);
-      setSelected(null);
+      setSelectedId(null);
     }
   }
 
@@ -596,6 +713,9 @@ export default function BLEPassengerTracker() {
   }, [selectedRoom, people]);
 
   const alertCount = people.filter((p) => p.alert).length;
+  // dérivé en direct depuis les dernières données reçues — ne fige jamais
+  // les valeurs (BPM, signal, position) au moment du clic
+  const selected = people.find((p) => p.id === selectedId) ?? null;
 
   return (
     <div style={styles.container}>
@@ -670,6 +790,12 @@ export default function BLEPassengerTracker() {
             >
               ⚡ Simuler un pic de stress
             </button>
+            <button
+              style={styles.testJumpBtn}
+              onClick={() => callTest(`/test/simulate-jump/${testBadge}`, null)}
+            >
+              🛰 Simuler un saut suspect
+            </button>
             {testStatus && (
               <div style={testStatus.ok ? styles.testStatusOk : styles.testStatusErr}>
                 {testStatus.msg}
@@ -682,7 +808,7 @@ export default function BLEPassengerTracker() {
             {people.map((p) => (
               <button
                 key={p.id}
-                onClick={() => setSelected(p)}
+                onClick={() => setSelectedId(p.id)}
                 style={{
                   ...styles.listItem,
                   borderColor: p.alert ? "#ff3b3b" : "rgba(255,255,255,0.08)",
@@ -708,24 +834,65 @@ export default function BLEPassengerTracker() {
               <PanelRow label="Secteur" value={selected.zone} />
               <PanelRow label="BPM" value={`${selected.bpm} bpm`} />
               <PanelRow label="Position" value={`x: ${selected.x.toFixed(1)}m · y: ${selected.y.toFixed(1)}m`} />
+              <PanelRow label="Localisation" value={modeLabel(selected.mode)} />
+              {selected.signal ? (
+                <div style={styles.signalBlock}>
+                  {Object.entries(selected.signal).map(([anchor, rssi]) => (
+                    <div key={anchor} style={styles.signalRow}>
+                      <span style={styles.panelLabel}>{anchor}</span>
+                      <span style={styles.signalBar}>
+                        <span
+                          style={{
+                            ...styles.signalBarFill,
+                            width: `${Math.max(0, Math.min(100, (rssi + 100) * 1.4))}%`,
+                          }}
+                        />
+                      </span>
+                      <span style={styles.panelValue}>{rssi} dBm</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div style={styles.signalNone}>Aucun signal BLE réel (position placée manuellement)</div>
+              )}
               {selected.alert && selected.motif && (
                 <div style={styles.motifText}>{selected.motif}</div>
               )}
+              {selected.anomaly && (
+                <div style={styles.anomalyText}>⚠ Saut de position suspect — vitesse implicite &gt; 3 m/s, indice d'usurpation possible</div>
+              )}
+              <button style={styles.profileBtn} onClick={() => setProfileOpen(true)}>
+                Voir la fiche complète
+              </button>
             </div>
           )}
         </div>
       </div>
 
       {selectedRoom && (
-        <div style={styles.overlay} onClick={() => setSelectedRoom(null)}>
+        <div style={styles.overlay} onClick={() => { setSelectedRoom(null); setRescueResult(null); }}>
           <div style={styles.overlayCard} onClick={(e) => e.stopPropagation()}>
             <div style={styles.overlayHeader}>
               <h3 style={styles.overlayTitle}>{selectedRoom.lines.join(" ")}</h3>
-              <button style={styles.closeBtn} onClick={() => setSelectedRoom(null)}>
-                Retour au vaisseau
-              </button>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button style={styles.rescueBtn} onClick={() => callRescue(selectedRoom.name)}>
+                  🚨 Mode sauvetage
+                </button>
+                <button style={styles.closeBtn} onClick={() => { setSelectedRoom(null); setRescueResult(null); }}>
+                  Retour au vaisseau
+                </button>
+              </div>
             </div>
             <canvas ref={roomCanvasRef} style={styles.roomCanvas} />
+            {rescueResult && rescueResult.zone === selectedRoom.name && (
+              <div style={rescueResult.can_seal ? styles.rescueOk : styles.rescueBlocked}>
+                {rescueResult.can_seal ? (
+                  <>✔ Salle vide — sas scellable en sécurité</>
+                ) : (
+                  <>⚠ Scellement impossible — présents : {rescueResult.trapped.join(", ")}</>
+                )}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -792,6 +959,96 @@ export default function BLEPassengerTracker() {
           </div>
         </div>
       )}
+
+      {profileOpen && selected && (
+        <div style={styles.overlay} onClick={() => setProfileOpen(false)}>
+          <div style={styles.profileCard} onClick={(e) => e.stopPropagation()}>
+            <div style={styles.overlayHeader}>
+              <div>
+                <h3 style={styles.overlayTitle}>{selected.name}</h3>
+                <div style={styles.profileSubtitle}>
+                  {selected.role}{selected.pilier ? ` · ${selected.pilier}` : ""}
+                </div>
+              </div>
+              <button style={styles.closeBtn} onClick={() => setProfileOpen(false)}>Fermer</button>
+            </div>
+
+            <div style={styles.profileBody}>
+              <div style={styles.profileLeft}>
+                <CharacterSilhouette alert={selected.alert} bpm={selected.bpm} />
+                <HealthGauge bpm={selected.bpm} />
+              </div>
+
+              <div style={styles.profileRight}>
+                <PanelRow label="ID BLE" value={selected.id} />
+                <PanelRow label="Secteur" value={selected.zone} />
+                <PanelRow label="Localisation" value={modeLabel(selected.mode)} />
+                <PanelRow label="BPM actuel" value={`${selected.bpm} bpm`} />
+                {selected.alert && selected.motif && (
+                  <div style={styles.motifText}>{selected.motif}</div>
+                )}
+                {selected.anomaly && (
+                  <div style={styles.anomalyText}>⚠ Saut de position suspect — indice d'usurpation possible</div>
+                )}
+
+                <div style={styles.bpmChartLabel}>Fréquence cardiaque (≈30 dernières secondes)</div>
+                <canvas ref={bpmChartRef} style={styles.bpmChart} />
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CharacterSilhouette({ alert, bpm }: { alert: boolean; bpm: number }) {
+  const color = alert ? "#ff4d5e" : bpm > 100 ? "#ffb84d" : "#39ff88";
+  return (
+    <div style={{ position: "relative", width: 120, margin: "0 auto" }}>
+      <img
+        src="/silhouette.png"
+        alt="Silhouette du profil"
+        style={{
+          width: "100%",
+          height: "auto",
+          display: "block",
+          filter: `drop-shadow(0 0 ${alert ? 14 : 8}px ${color})`,
+        }}
+      />
+      {/* voyant vital, coin bas-droit de la silhouette */}
+      <span
+        style={{
+          position: "absolute",
+          bottom: 4,
+          right: 4,
+          width: 14,
+          height: 14,
+          borderRadius: "50%",
+          background: color,
+          color: color,
+          border: "2px solid #050f0a",
+          boxShadow: `0 0 8px ${color}`,
+          animation: alert ? "astra-pulse 0.8s ease-in-out infinite" : "astra-pulse 2.2s ease-in-out infinite",
+        }}
+      />
+    </div>
+  );
+}
+
+function HealthGauge({ bpm }: { bpm: number }) {
+  const level = bpm > 110 ? "critique" : bpm > 90 ? "vigilance" : "calme";
+  const color = level === "critique" ? "#ff4d5e" : level === "vigilance" ? "#ffb84d" : "#39ff88";
+  const label = level === "critique" ? "Stress critique" : level === "vigilance" ? "Vigilance" : "Calme";
+  const pct = Math.max(4, Math.min(100, ((bpm - 55) / (145 - 55)) * 100));
+  return (
+    <div style={styles.gaugeWrap}>
+      <div style={styles.gaugeLabelRow}>
+        <span style={{ color }}>{label}</span>
+      </div>
+      <div style={styles.gaugeTrack}>
+        <div style={{ ...styles.gaugeFill, width: `${pct}%`, background: color }} />
+      </div>
     </div>
   );
 }
@@ -816,10 +1073,12 @@ function connLabel(c: ConnState) {
   return "Déconnecté — reconnexion en cours";
 }
 
-// ---------------------------------------------------------------------------
-// Styles inline (aucune dépendance externe — remplace par ton système
-// de design/Tailwind si le reste du projet en utilise un)
-// ---------------------------------------------------------------------------
+function modeLabel(mode: Passenger["mode"]) {
+  if (mode === "trilateration") return "Trilatération (3+ ancres)";
+  if (mode === "1-ancre") return "Mode dégradé (1 ancre)";
+  return "Position manuelle (test)";
+}
+
 // ---------------------------------------------------------------------------
 // Styles inline — thème HUD terminal de vaisseau (noir/vert phosphore).
 // Langage colorimétrique sémantique, pas décoratif : vert = nominal/sécurisé,
@@ -948,6 +1207,17 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     fontFamily: FONT_MONO,
   },
+  testJumpBtn: {
+    background: "rgba(255,184,77,0.08)",
+    border: "1px dashed rgba(255,184,77,0.4)",
+    borderRadius: 3,
+    color: "#ffcf85",
+    padding: "6px 8px",
+    fontSize: 11,
+    fontWeight: 700,
+    cursor: "pointer",
+    fontFamily: FONT_MONO,
+  },
   testStatusOk: {
     fontSize: 10,
     color: "#39ff88",
@@ -992,12 +1262,56 @@ const styles: Record<string, React.CSSProperties> = {
   panelRow: { display: "flex", justifyContent: "space-between", fontSize: 12, padding: "3px 0" },
   panelLabel: { color: "#5f9a7c" },
   panelValue: { color: "#d7ffe8" },
+  signalBlock: {
+    marginTop: 6,
+    paddingTop: 6,
+    borderTop: "1px solid rgba(57,255,136,0.12)",
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+  },
+  signalRow: {
+    display: "grid",
+    gridTemplateColumns: "28px 1fr 52px",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 11,
+  },
+  signalBar: {
+    height: 5,
+    borderRadius: 2,
+    background: "rgba(57,255,136,0.1)",
+    overflow: "hidden",
+    display: "block",
+  },
+  signalBarFill: {
+    display: "block",
+    height: "100%",
+    background: "#39ff88",
+    borderRadius: 2,
+  },
+  signalNone: {
+    marginTop: 6,
+    paddingTop: 6,
+    borderTop: "1px solid rgba(57,255,136,0.12)",
+    fontSize: 10,
+    color: "#5f9a7c",
+    fontStyle: "italic",
+  },
   motifText: {
     marginTop: 8,
     fontSize: 11,
     color: "#ff8c96",
     lineHeight: 1.4,
     borderTop: "1px solid rgba(57,255,136,0.15)",
+    paddingTop: 8,
+  },
+  anomalyText: {
+    marginTop: 8,
+    fontSize: 11,
+    color: "#ffcf85",
+    lineHeight: 1.4,
+    borderTop: "1px solid rgba(255,184,77,0.25)",
     paddingTop: 8,
   },
   overlay: {
@@ -1040,6 +1354,37 @@ const styles: Record<string, React.CSSProperties> = {
     fontFamily: FONT_MONO,
   },
   roomCanvas: { width: "100%", height: "auto", borderRadius: 4, display: "block" },
+  rescueBtn: {
+    background: "rgba(255,77,94,0.12)",
+    border: "1px solid rgba(255,77,94,0.4)",
+    borderRadius: 3,
+    color: "#ff8c96",
+    padding: "6px 12px",
+    fontSize: 11,
+    fontWeight: 700,
+    cursor: "pointer",
+    fontFamily: FONT_MONO,
+  },
+  rescueOk: {
+    marginTop: 12,
+    padding: "12px 16px",
+    borderRadius: 6,
+    background: "rgba(57,255,136,0.1)",
+    border: "1px solid rgba(57,255,136,0.4)",
+    color: "#39ff88",
+    fontSize: 13,
+    fontFamily: FONT_MONO,
+  },
+  rescueBlocked: {
+    marginTop: 12,
+    padding: "12px 16px",
+    borderRadius: 6,
+    background: "rgba(255,77,94,0.1)",
+    border: "1px solid rgba(255,77,94,0.4)",
+    color: "#ff8c96",
+    fontSize: 13,
+    fontFamily: FONT_MONO,
+  },
   logsBtn: {
     background: "rgba(57,255,136,0.06)",
     border: "1px solid rgba(57,255,136,0.25)",
@@ -1115,4 +1460,59 @@ const styles: Record<string, React.CSSProperties> = {
     letterSpacing: 0.5,
     fontFamily: FONT_MONO,
   },
+  profileBtn: {
+    marginTop: 10,
+    width: "100%",
+    background: "rgba(57,255,136,0.08)",
+    border: "1px solid rgba(57,255,136,0.3)",
+    borderRadius: 3,
+    color: "#39ff88",
+    padding: "8px 10px",
+    fontSize: 11,
+    fontWeight: 700,
+    cursor: "pointer",
+    fontFamily: FONT_MONO,
+    letterSpacing: 0.5,
+  },
+  profileCard: {
+    background: "#050f0a",
+    border: "1px solid rgba(57,255,136,0.3)",
+    borderRadius: 6,
+    padding: 22,
+    maxWidth: 680,
+    width: "100%",
+    maxHeight: "85vh",
+    overflowY: "auto",
+    fontFamily: FONT_MONO,
+    boxShadow: "0 0 48px rgba(57,255,136,0.1)",
+  },
+  profileSubtitle: { fontSize: 11, color: "#5f9a7c", marginTop: 2 },
+  profileBody: { display: "flex", gap: 22, flexWrap: "wrap", marginTop: 6 },
+  profileLeft: {
+    width: 160,
+    display: "flex",
+    flexDirection: "column",
+    gap: 16,
+    alignItems: "center",
+    flexShrink: 0,
+  },
+  profileRight: { flex: 1, minWidth: 260, display: "flex", flexDirection: "column", gap: 4 },
+  bpmChartLabel: { fontSize: 10, color: "#5f9a7c", marginTop: 14, marginBottom: 4, textTransform: "uppercase", letterSpacing: 0.5 },
+  bpmChart: {
+    width: "100%",
+    height: "auto",
+    borderRadius: 4,
+    border: "1px solid rgba(57,255,136,0.15)",
+    display: "block",
+  },
+  gaugeWrap: { width: "100%", display: "flex", flexDirection: "column", gap: 6 },
+  gaugeLabelRow: { fontSize: 11, fontWeight: 700, textAlign: "center" },
+  gaugeTrack: {
+    width: "100%",
+    height: 6,
+    borderRadius: 3,
+    background: "rgba(255,255,255,0.06)",
+    overflow: "hidden",
+  },
+  gaugeFill: { height: "100%", borderRadius: 3 },
 };

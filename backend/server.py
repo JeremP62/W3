@@ -1,9 +1,10 @@
-import asyncio, math, random, sqlite3
+import asyncio, math, random, sqlite3, time
 from collections import deque
 import numpy as np
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.optimize import least_squares
+from collections import deque
 
 app = FastAPI()
 app.add_middleware(
@@ -294,13 +295,25 @@ bpm_history = {}   # {badge_id: deque des dernieres valeurs, pour la courbe du p
 prev_alert = {}    # {badge_id: bool} - detecte les transitions pour ne logger qu'une fois
 
 
+rssi_history = {} # { (badge, anchor): deque(maxlen=5) }
+
 def ingest(badge, anchor, rssi):
-    s = state.setdefault(badge, {})
-    s[anchor] = rssi if anchor not in s else 0.7 * s[anchor] + 0.3 * rssi
+    key = (badge, anchor)
+    if key not in rssi_history:
+        rssi_history[key] = deque(maxlen=5)
+    
+    rssi_history[key].append(rssi)
+    
+    # Utilisation de la médiane pour éliminer les valeurs déviantes
+    median_rssi = float(np.median(rssi_history[key]))
+    state.setdefault(badge, {})[anchor] = median_rssi
 
 
 def rssi_to_dist(rssi):
-    return 10 ** ((TX_POWER - rssi) / (10 * N))
+    # Clamper le RSSI pour éviter des explosions de distances théoriques
+    rssi_clamped = min(max(rssi, -90), -35)
+    dist = 10 ** ((TX_POWER - rssi_clamped) / (10 * N))
+    return min(dist, 10.0) # Plafond max
 
 
 def trilaterate(dists):
@@ -308,11 +321,16 @@ def trilaterate(dists):
     pts = np.array([ANCHORS[i] for i in ids])
     d = np.array([dists[i] for i in ids])
     res = lambda p: np.linalg.norm(pts - p, axis=1) - d
-    result = least_squares(res, pts.mean(axis=0), bounds=([-1, -1], [16, 9]))
-    return result.x
+    result = least_squares(
+    res, 
+    pts.mean(axis=0), 
+    bounds=([0.5, 0.5], [ROOM_WIDTH_M_SERVER - 0.5, ROOM_HEIGHT_M_SERVER - 0.5])
+)
 
 
 smoothed_positions = {}
+last_seen = {}   # {badge_id: (x, y, timestamp)} - pour detecter les sauts de position impossibles
+forced_anomaly = {}  # {badge_id: timestamp d'expiration} - saut suspect force a titre de demo
 
 
 def zone_of(x, y):
@@ -375,6 +393,48 @@ def snapshot():
             signal = {a: round(r) for a, r in s.items()}
         zone = zone_of(x, y)
 
+        # --- 1. Restriction de vitesse (Clamp) sur les coordonnées brutes ---
+        now_t = time.time()
+        prev_seen = last_seen.get(badge)
+
+        if mode != "test" and prev_seen is not None:
+            px, py, pt = prev_seen
+            dt = max(now_t - pt, 0.05)  # Sécurité contre division par zéro
+            
+            MAX_SPEED_M_S = 1.8  # Vitesse max réaliste (1.8 m/s)
+            max_dist = MAX_SPEED_M_S * dt
+
+            dist_raw = math.hypot(raw_x - px, raw_y - py)
+            if dist_raw > max_dist and dist_raw > 0:
+                # On ramène le point brut sur le cercle de rayon max_dist
+                ratio = max_dist / dist_raw
+                raw_x = px + (raw_x - px) * ratio
+                raw_y = py + (raw_y - py) * ratio
+
+        # --- 2. Lissage exponentiel classique ---
+        prev_pos = smoothed_positions.get(badge, np.array([raw_x, raw_y]))
+        smoothed = 0.65 * prev_pos + 0.35 * np.array([raw_x, raw_y])
+        smoothed_positions[badge] = smoothed
+        x, y = smoothed
+        signal = {a: round(r) for a, r in s.items()}
+
+        # --- 3. Détection d'anomalie (saut suspect / usurpation) ---
+        anomaly = False
+        if mode != "test" and prev_seen is not None:
+            px, py, pt = prev_seen
+            dt = now_t - pt
+            if dt > 0.05:
+                # Vitesse calculée après filtrage pour repérer les sauts bruts
+                speed = math.hypot(x - px, y - py) / dt
+                if speed > 2.5:  # Seuil de téléportation suspecte
+                    anomaly = True
+
+        last_seen[badge] = (x, y, now_t)
+
+        if forced_anomaly.get(badge, 0) > now_t:
+            # Déclenchement forcé à titre de démo
+            anomaly = True
+
         crew = CREW.get(badge)
         bpm = update_bpm(badge)
         zone_sec = SECURITY.get(zone)  # None si "Coursive" (pas une salle)
@@ -421,6 +481,7 @@ def snapshot():
             "motif": motif,
             "signal": signal,   # {"A1": -62, "A2": -70, ...} ou null en mode test
             "mode": mode,       # "trilateration" | "1-ancre" | "test"
+            "anomaly": anomaly, # true si saut de position suspect (indice d'usurpation)
         })
     return out
 
@@ -612,6 +673,20 @@ def get_logs(limit: int = 20):
     return {"logs": [dict(r) for r in rows]}
 
 
+# --- Mode sauvetage : verifie qu'une salle est vide avant de sceller un sas -
+
+@app.post("/rescue/{zone}")
+def rescue(zone: str):
+    """En cas d'incident (incendie, depressurisation...), verifie qui se
+    trouve encore dans la salle avant d'autoriser le scellement du sas.
+    Utilise le dernier etat connu (positions du dernier snapshot)."""
+    if zone not in ZONES:
+        return {"error": f"Salle inconnue. Salles valides : {list(ZONES.keys())}"}
+    people = snapshot()
+    trapped = [p["name"] for p in people if p["zone"] == zone]
+    return {"zone": zone, "trapped": trapped, "can_seal": len(trapped) == 0}
+
+
 # --- Mode test sans BLE : placer un badge dans une salle a la main ---------
 
 @app.get("/test/rooms")
@@ -679,3 +754,12 @@ def induce_stress(badge: str):
     bpm = random.uniform(125, 142)
     current_bpm[badge] = bpm
     return {"badge": badge, "bpm": round(bpm)}
+
+
+@app.post("/test/simulate-jump/{badge}")
+def simulate_jump(badge: str):
+    """Force un 'saut de position suspect' a des fins de demonstration,
+    visible pendant 2,5 secondes sur le dashboard. Le badge doit deja etre
+    suivi (place via /test/move ou du vrai BLE)."""
+    forced_anomaly[badge] = time.time() + 2.5
+    return {"badge": badge, "forced_anomaly_until": "2.5s"}
