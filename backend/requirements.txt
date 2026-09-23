@@ -1,0 +1,7 @@
+bleak
+httpx
+fastapi
+uvicorn[standard]
+numpy
+scipy
+websockets
