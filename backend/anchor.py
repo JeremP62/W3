@@ -1,17 +1,15 @@
-﻿import asyncio, math, random, sqlite3, time
+﻿import asyncio
+from contextlib import asynccontextmanager
+import math
+import random
+import sqlite3
+import time
 from collections import deque
 import numpy as np
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from scipy.optimize import least_squares
-
-app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+import uvicorn
 
 # ---------------------------------------------------------------------------
 # Base de données locale (SQLite)
@@ -263,7 +261,6 @@ forced_anomaly = {}
 def ingest(badge, anchor, rssi):
     key = (badge, anchor)
     if key not in rssi_history:
-        # Tampon réduit à 3 valeurs pour supprimer la latence
         rssi_history[key] = deque(maxlen=3)
     
     rssi_history[key].append(rssi)
@@ -337,7 +334,7 @@ def snapshot():
             else:
                 continue
 
-            # --- Confinement géométrique (Clamping) dans la coque ---
+            # Clamping dans la coque
             MARGIN_X = 1.2
             MARGIN_Y = 1.2
             raw_x = float(np.clip(raw_x, MARGIN_X, ROOM_WIDTH_M_SERVER - MARGIN_X))
@@ -350,7 +347,7 @@ def snapshot():
                 px, py, pt = prev_seen
                 dt = max(now_t - pt, 0.05)
                 
-                MAX_SPEED_M_S = 3.0 # Tolérance augmentée à 3.0 m/s pour réactivité
+                MAX_SPEED_M_S = 3.0
                 max_dist = MAX_SPEED_M_S * dt
 
                 dist_raw = math.hypot(raw_x - px, raw_y - py)
@@ -359,7 +356,7 @@ def snapshot():
                     raw_x = px + (raw_x - px) * ratio
                     raw_y = py + (raw_y - py) * ratio
 
-            # --- Lissage hyper-réactif (85% nouvelle mesure, 15% ancienne) ---
+            # Lissage ultra réactif
             prev_pos = smoothed_positions.get(badge, np.array([raw_x, raw_y]))
             smoothed = 0.15 * prev_pos + 0.85 * np.array([raw_x, raw_y])
             smoothed_positions[badge] = smoothed
@@ -463,7 +460,6 @@ async def sim_loop():
     while True:
         now_t = time.time()
         for badge, p in people.items():
-            # DESACTIVATION DE LA SIMULATION LORSQU'UN BADGE REEL EST CAPTÉ (dans les 4 dernières secondes)
             if badge in last_seen and (now_t - last_seen[badge][2]) < 4.0:
                 continue
 
@@ -498,10 +494,24 @@ async def broadcast_loop():
         await asyncio.sleep(0.2)
 
 
-@app.on_event("startup")
-async def start():
+# ---------------------------------------------------------------------------
+# Gestionnaire Lifespan (Démarrage et Arrêt FastAPI propre)
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     asyncio.create_task(sim_loop())
     asyncio.create_task(broadcast_loop())
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.websocket("/ws")
@@ -677,3 +687,10 @@ def induce_stress(badge: str):
 def simulate_jump(badge: str):
     forced_anomaly[badge] = time.time() + 2.5
     return {"badge": badge, "forced_anomaly_until": "2.5s"}
+
+
+# ---------------------------------------------------------------------------
+# Point d'entrée pour lancement direct
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run("anchor:app", host="0.0.0.0", port=8000, reload=True)
