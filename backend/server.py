@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS Logs_Acces_Securise (
     FOREIGN KEY (id_zone) REFERENCES Zones_Vaisseau(id_zone)
 );
 
+-- Habilitations : quelles salles chaque role a le droit d'utiliser, avant
+-- meme de regarder le BPM. Un role non habilite est TOUJOURS refuse dans
+-- cette zone, meme au repos. Un role habilite reste ensuite soumis au
+-- seuil BPM de la zone (double controle : identite + etat physiologique).
 CREATE TABLE IF NOT EXISTS Autorisations_Zone (
     id_role INTEGER NOT NULL,
     id_zone INTEGER NOT NULL,
@@ -75,6 +79,9 @@ CREATE TABLE IF NOT EXISTS Autorisations_Zone (
 );
 """
 
+# Données fictives de départ (Mission Aurora Star). Ces INSERT ne sont exécutés
+# qu'au tout premier lancement, si les tables sont vides — pas de doublons
+# aux redémarrages suivants.
 SEED_SQL = """
 INSERT INTO Zones_Vaisseau (nom_zone, niveau_securite, bpm_max_autorise) VALUES
 ('Cafétéria', 1, 180),
@@ -117,13 +124,24 @@ INSERT INTO Logs_Acces_Securise (id_astronaute, id_zone, horodatage, bpm_lors_de
 (3, 1, '2026-09-22 09:18:00', 85, 1, NULL);
 """
 
+# Seed separe pour les habilitations : verifie independamment si vide, pour
+# rattraper automatiquement une base existante creee AVANT l'ajout de cette
+# table (pas besoin de supprimer astra.db a la main a chaque evolution).
 AUTH_SEED_SQL = """
+-- Habilitations par role (id_zone : 1 Cafeteria, 2 Quartiers, 3 Infirmerie,
+-- 4 Laboratoire, 5 Poste de Pilotage, 6 Salle Serveur, 7 Reacteur)
 INSERT INTO Autorisations_Zone (id_role, id_zone) VALUES
+-- Commandant de bord (1) : acces total au vaisseau
 (1,1),(1,2),(1,3),(1,4),(1,5),(1,6),(1,7),
+-- Pilote / Navigateur (2) : zones communes + poste de pilotage
 (2,1),(2,2),(2,3),(2,5),
+-- Medecin-Psychiatre (3) : zones communes + infirmerie (deja incluse)
 (3,1),(3,2),(3,3),
+-- Ingenieur Agronome (4) : zones communes + laboratoire
 (4,1),(4,2),(4,3),(4,4),
+-- Ingenieur Energie (5) : zones communes + reacteur
 (5,1),(5,2),(5,3),(5,7),
+-- Specialiste Cyber & IA (6) : zones communes + labo + salle serveur
 (6,1),(6,2),(6,3),(6,4),(6,6);
 """
 
@@ -139,17 +157,26 @@ def init_db():
     conn.executescript(SCHEMA_SQL)
     if conn.execute("SELECT COUNT(*) AS c FROM Zones_Vaisseau").fetchone()["c"] == 0:
         conn.executescript(SEED_SQL)
+    # Verification independante : rattrape une base existante ou la table
+    # Autorisations_Zone a ete creee vide (schema ajoute apres coup).
     if conn.execute("SELECT COUNT(*) AS c FROM Autorisations_Zone").fetchone()["c"] == 0:
         conn.executescript(AUTH_SEED_SQL)
+    # Relie 3 membres de l'équipage aux badges BLE physiques testables
+    # (ASTRA-001/002/003). Idempotent : peut être relancé sans risque.
     conn.execute("UPDATE Equipage SET astra_badge_id='ASTRA-001' WHERE nom_complet='Elena Rostova'")
     conn.execute("UPDATE Equipage SET astra_badge_id='ASTRA-002' WHERE nom_complet='Chloe Dubois'")
     conn.execute("UPDATE Equipage SET astra_badge_id='ASTRA-003' WHERE nom_complet='Marcus Vance'")
+    # Migration : renomme l'ancienne "Salle Serveur" si une base existante
+    # a deja ete creee avant ce changement (idempotent, sans effet sinon).
     conn.execute("UPDATE Zones_Vaisseau SET nom_zone='Poste de Sécurité & Serveur' WHERE nom_zone='Salle Serveur'")
     conn.commit()
     conn.close()
 
 
 def load_crew():
+    """{badge_id: {id_astronaute, name, role, pilier, profil, clearance}} —
+    uniquement les membres d'équipage reliés à un badge BLE physique.
+    "clearance" est l'ensemble des noms de salles autorisées pour le role."""
     conn = get_db()
     rows = conn.execute("""
         SELECT e.id_astronaute, e.nom_complet, e.astra_badge_id, e.profil_psy_base,
@@ -180,6 +207,7 @@ def load_crew():
 
 
 def load_zone_security():
+    """{nom_zone: {id_zone, niveau_securite, bpm_max_autorise}}"""
     conn = get_db()
     rows = conn.execute("SELECT * FROM Zones_Vaisseau").fetchall()
     conn.close()
@@ -215,8 +243,12 @@ def log_telemetry(id_astronaute, bpm, stress):
 
 
 # ---------------------------------------------------------------------------
-# Géométrie du vaisseau
+# Géométrie du vaisseau — DOIT correspondre exactement aux constantes ROOMS /
+# ANCHORS / HULL / PILOTAGE du composant frontend BLEPassengerTracker.tsx
+# (même unité : mètres, même repère, origine en haut à gauche).
 # ---------------------------------------------------------------------------
+# Dimensions du vaisseau (memes valeurs que ROOM_WIDTH_M/ROOM_HEIGHT_M cote
+# frontend) - utilisees pour borner le deplacement libre au clavier.
 ROOM_WIDTH_M_SERVER = 15
 ROOM_HEIGHT_M_SERVER = 8.3
 
@@ -227,6 +259,9 @@ ANCHORS = {
     "A4": (3.5, 6.6),
 }
 
+# Direction vers laquelle le point s'éloigne de chaque ancre, quand une seule
+# ancre est active (pas de direction réelle calculable, seulement une
+# distance). À CALIBRER le jour J selon la disposition réelle de la salle.
 ANCHOR_DIRECTIONS = {
     "A1": (-1, -1),
     "A2": (-1, 0.3),
@@ -234,48 +269,39 @@ ANCHOR_DIRECTIONS = {
     "A4": (1, -0.3),
 }
 
+# Géométrie pure (x1, y1, x2, y2) — la politique de sécurité (niveau, seuil
+# BPM) vit dans la base et est chargée séparément via load_zone_security().
 ZONES = {
-    "Réacteur":                   (1.35, 2.45, 3.08, 5.65),
-    "Quartiers des équipes":     (3.45, 1.28, 5.20, 3.30),
-    "Cafétéria":                 (3.45, 4.85, 5.20, 6.85),
-    "Laboratoire":               (6.83, 1.28, 8.57, 3.30),
-    "Infirmerie":                (6.83, 4.85, 8.57, 6.85),
+    "Réacteur":              (1.35, 2.45, 3.08, 5.65),
+    "Quartiers des équipes": (3.45, 1.28, 5.20, 3.30),
+    "Cafétéria":             (3.45, 4.85, 5.20, 6.85),
+    "Laboratoire":           (6.83, 1.28, 8.57, 3.30),
+    "Infirmerie":            (6.83, 4.85, 8.57, 6.85),
     "Poste de Sécurité & Serveur": (10.20, 1.28, 11.52, 3.30),
-    "Poste de Pilotage":         (11.52, 3.55, 13.9, 4.45),
+    "Poste de Pilotage":     (11.52, 3.55, 13.9, 4.45),  # englobant du triangle
 }
 
 init_db()
-CREW = load_crew()
-SECURITY = load_zone_security()
+CREW = load_crew()               # {badge_id: infos equipage} depuis la DB
+SECURITY = load_zone_security()  # {nom_zone: seuils} depuis la DB
 
-TX_POWER, N = -59, 2.2
+TX_POWER, N = -59, 2.2   # RSSI à 1 m et exposant de perte : À CALIBRER (voir étape 6)
 
 state, clients = {}, set()
-manual_overrides = {}
-current_bpm = {}
-bpm_history = {}
-prev_alert = {}
-rssi_history = {}
-
-smoothed_positions = {}
-last_seen = {}
-forced_anomaly = {}
+manual_overrides = {}  # {badge_id: (x, y)} - positions forcees pour tester sans BLE
+current_bpm = {}   # {badge_id: bpm simule} - EN ATTENTE d'un vrai capteur biometrique
+bpm_history = {}   # {badge_id: deque des dernieres valeurs, pour la courbe du profil}
+prev_alert = {}    # {badge_id: bool} - detecte les transitions pour ne logger qu'une fois
 
 
 def ingest(badge, anchor, rssi):
-    key = (badge, anchor)
-    if key not in rssi_history:
-        rssi_history[key] = deque(maxlen=5)
-    
-    rssi_history[key].append(rssi)
-    median_rssi = float(np.median(rssi_history[key]))
-    state.setdefault(badge, {})[anchor] = median_rssi
+    s = state.setdefault(badge, {})
+    s[anchor] = rssi if anchor not in s else 0.7 * s[anchor] + 0.3 * rssi
 
 
 def rssi_to_dist(rssi):
-    rssi_clamped = min(max(rssi, -90), -35)
-    dist = 10 ** ((TX_POWER - rssi_clamped) / (10 * N))
-    return min(dist, 10.0)
+    rssi_clamped = min(max(rssi, -95), -35)  # evite les distances aberrantes sur RSSI extreme
+    return min(10 ** ((TX_POWER - rssi_clamped) / (10 * N)), 12.0)
 
 
 def trilaterate(dists):
@@ -283,12 +309,13 @@ def trilaterate(dists):
     pts = np.array([ANCHORS[i] for i in ids])
     d = np.array([dists[i] for i in ids])
     res = lambda p: np.linalg.norm(pts - p, axis=1) - d
-    result = least_squares(
-        res, 
-        pts.mean(axis=0), 
-        bounds=([1.0, 1.0], [ROOM_WIDTH_M_SERVER - 1.0, ROOM_HEIGHT_M_SERVER - 1.0])
-    )
+    result = least_squares(res, pts.mean(axis=0), bounds=([0.5, 0.5], [ROOM_WIDTH_M_SERVER - 0.5, ROOM_HEIGHT_M_SERVER - 0.5]))
     return result.x
+
+
+smoothed_positions = {}
+last_seen = {}   # {badge_id: (x, y, timestamp)} - pour detecter les sauts de position impossibles
+forced_anomaly = {}  # {badge_id: timestamp d'expiration} - saut suspect force a titre de demo
 
 
 def zone_of(x, y):
@@ -298,17 +325,21 @@ def zone_of(x, y):
     return "Coursive"
 
 
-baseline_bpm = {}
+baseline_bpm = {}  # {badge_id: valeur de repos personnelle, fixee une fois}
 
 
 def update_bpm(badge):
+    """Simule un BPM plausible : marche aleatoire QUI REVIENT vers une
+    valeur de repos personnelle (mean-reverting), plutot qu'une derive
+    libre qui finirait par atteindre des extremes au hasard.
+    EN ATTENTE d'integration d'un vrai capteur (bracelet/montre connectee)."""
     baseline = baseline_bpm.setdefault(badge, random.uniform(68, 82))
     prev = current_bpm.get(badge, baseline)
-    pull_to_baseline = (baseline - prev) * 0.08
+    pull_to_baseline = (baseline - prev) * 0.08   # tire doucement vers le repos
     bpm = prev + pull_to_baseline + random.gauss(0, 1.8)
     bpm = max(55, min(bpm, 145))
     current_bpm[badge] = bpm
-    bpm_history.setdefault(badge, deque(maxlen=150)).append(round(bpm))
+    bpm_history.setdefault(badge, deque(maxlen=150)).append(round(bpm))  # ~30s d'historique
     return bpm
 
 
@@ -317,11 +348,12 @@ def snapshot():
     all_badges = set(state.keys()) | set(manual_overrides.keys())
     for badge in all_badges:
         if badge in manual_overrides:
+            # position forcee manuellement (mode test sans BLE) : on saute
+            # entierement le calcul RSSI/trilateration
             x, y = manual_overrides[badge]
             smoothed_positions[badge] = np.array([x, y])
-            signal = None
+            signal = None          # pas de vrai signal BLE en mode test
             mode = "test"
-            anomaly = False
         else:
             s = state[badge]
             if len(s) >= 3:
@@ -333,73 +365,58 @@ def snapshot():
                 dist = rssi_to_dist(s[nearest_anchor])
                 direction = np.array(ANCHOR_DIRECTIONS[nearest_anchor], dtype=float)
                 direction = direction / (np.linalg.norm(direction) or 1)
-                # Distance max réduite pour éviter de sortir de la coque en mode 1-ancre
-                raw_x, raw_y = anchor_pos + direction * min(dist, 2.0)
+                raw_x, raw_y = anchor_pos + direction * min(dist, 5.5)
                 mode = "1-ancre"
             else:
                 continue
 
-            # --- CORRECTION : Clamping Strict dans la coque utile du vaisseau ---
-            # Marges ajustées pour empêcher toute sortie de la zone dessinée
-            MARGIN_X = 1.2
-            MARGIN_Y = 1.2
-            raw_x = float(np.clip(raw_x, MARGIN_X, ROOM_WIDTH_M_SERVER - MARGIN_X))
-            raw_y = float(np.clip(raw_y, MARGIN_Y, ROOM_HEIGHT_M_SERVER - MARGIN_Y))
-
-            # --- 1. Restriction de vitesse (Clamp) sur les coordonnées brutes ---
-            now_t = time.time()
-            prev_seen = last_seen.get(badge)
-
-            if prev_seen is not None:
-                px, py, pt = prev_seen
-                dt = max(now_t - pt, 0.05)
-                
-                MAX_SPEED_M_S = 1.8
-                max_dist = MAX_SPEED_M_S * dt
-
-                dist_raw = math.hypot(raw_x - px, raw_y - py)
-                if dist_raw > max_dist and dist_raw > 0:
-                    ratio = max_dist / dist_raw
-                    raw_x = px + (raw_x - px) * ratio
-                    raw_y = py + (raw_y - py) * ratio
-
-            # --- 2. Lissage exponentiel classique ---
-            prev_pos = smoothed_positions.get(badge, np.array([raw_x, raw_y]))
-            smoothed = 0.65 * prev_pos + 0.35 * np.array([raw_x, raw_y])
+            prev = smoothed_positions.get(badge, np.array([raw_x, raw_y]))
+            smoothed = 0.65 * prev + 0.35 * np.array([raw_x, raw_y])
             smoothed_positions[badge] = smoothed
             x, y = smoothed
+            # RSSI brut par ancre (arrondi), pour affichage cote dashboard
             signal = {a: round(r) for a, r in s.items()}
+        zone = zone_of(x, y)
 
-            # --- 3. Détection d'anomalie (saut suspect / usurpation) ---
-            anomaly = False
-            if prev_seen is not None:
-                px, py, pt = prev_seen
-                dt = now_t - pt
-                if dt > 0.05:
-                    speed = math.hypot(x - px, y - py) / dt
-                    if speed > 2.5:
-                        anomaly = True
-
-            last_seen[badge] = (x, y, now_t)
-
+        # Detection de saut de position impossible (indice d'usurpation) :
+        # si le badge "teleporte" a une vitesse humainement impossible entre
+        # deux mesures reelles, on le signale (heuristique, pas une preuve).
+        # Le mode test (teleportation volontaire) n'est jamais concerne.
         now_t = time.time()
+        anomaly = False
+        prev_seen = last_seen.get(badge)
+        if mode != "test" and prev_seen is not None:
+            px, py, pt = prev_seen
+            dt = now_t - pt
+            if dt > 0.05:
+                speed = math.hypot(x - px, y - py) / dt
+                if speed > 3.0:  # ~3 m/s : au-dela, sprint humain improbable en interieur
+                    anomaly = True
+        last_seen[badge] = (x, y, now_t)
         if forced_anomaly.get(badge, 0) > now_t:
+            # declenchement force a titre de demo (bouton "Simuler un saut
+            # suspect"), visible quelques secondes puis s'eteint tout seul
             anomaly = True
 
-        zone = zone_of(x, y)
         crew = CREW.get(badge)
         bpm = update_bpm(badge)
-        zone_sec = SECURITY.get(zone)
+        zone_sec = SECURITY.get(zone)  # None si "Coursive" (pas une salle)
 
         if zone_sec is None:
             allowed, motif = True, None
         elif crew is None:
+            # badge sans profil equipage (ex : intrus) - seules les zones
+            # publiques (niveau < 4) restent accessibles
             allowed = zone_sec["niveau_securite"] < 4
             motif = None if allowed else "Badge non enregistré dans l'équipage — accès zone critique refusé."
         elif zone not in crew["clearance"]:
+            # double controle 1/2 : le role n'a meme pas le droit d'entrer
+            # dans cette salle, peu importe l'etat physiologique
             allowed = False
             motif = f"Rôle « {crew['role']} » non habilité pour la zone {zone}."
         else:
+            # double controle 2/2 : role habilite, mais BPM au-dessus du
+            # seuil de la zone au moment present
             allowed = bpm <= zone_sec["bpm_max_autorise"]
             motif = None if allowed else (
                 f"BPM ({bpm:.0f}) supérieur au seuil autorisé ({zone_sec['bpm_max_autorise']}) "
@@ -407,6 +424,7 @@ def snapshot():
             )
 
         alert = not allowed
+        # ne journalise qu'au moment de la transition (pas a chaque frame)
         if alert and not prev_alert.get(badge, False) and crew is not None and zone_sec is not None:
             stress_est = round(min(10.0, max(0.0, (bpm - 70) / 8)), 1)
             log_access(crew["id_astronaute"], zone_sec["id_zone"], round(bpm), False, motif)
@@ -424,9 +442,9 @@ def snapshot():
             "bpm": round(bpm),
             "alert": alert,
             "motif": motif,
-            "signal": signal,
-            "mode": mode,
-            "anomaly": anomaly,
+            "signal": signal,   # {"A1": -62, "A2": -70, ...} ou null en mode test
+            "mode": mode,       # "trilateration" | "1-ancre" | "test"
+            "anomaly": anomaly, # true si saut de position suspect (indice d'usurpation)
         })
     return out
 
@@ -501,6 +519,7 @@ async def broadcast_loop():
 @app.on_event("startup")
 async def start():
     asyncio.create_task(broadcast_loop())
+    # asyncio.create_task(sim_loop())  # simulateur desactive pour le test reel
 
 
 @app.websocket("/ws")
@@ -527,7 +546,7 @@ def debug():
 @app.get("/crew")
 def get_crew():
     crew_json = {
-        badge: {**info, "clearance": sorted(info["clearance"])}
+        badge: {**info, "clearance": sorted(info["clearance"])}  # set -> liste triee (JSON)
         for badge, info in CREW.items()
     }
     return {"crew": crew_json, "zones_security": SECURITY}
@@ -535,6 +554,8 @@ def get_crew():
 
 @app.post("/roles/authorize")
 def authorize_role(d: dict):
+    """Ajoute une habilitation role -> salle.
+    Payload : {"role": "Ingénieur Agronome", "room": "Réacteur"}"""
     role_name, room = d["role"], d["room"]
     if room not in ZONES:
         return {"error": f"Salle inconnue. Salles valides : {list(ZONES.keys())}"}
@@ -551,12 +572,14 @@ def authorize_role(d: dict):
     conn.commit()
     conn.close()
     global CREW
-    CREW = load_crew()
+    CREW = load_crew()  # recharge pour appliquer immediatement le changement
     return {"authorized": {"role": role_name, "room": room}}
 
 
 @app.post("/roles/revoke")
 def revoke_role_access(d: dict):
+    """Retire une habilitation role -> salle.
+    Payload : {"role": "Ingénieur Agronome", "room": "Réacteur"}"""
     role_name, room = d["role"], d["room"]
     conn = get_db()
     conn.execute("""
@@ -573,6 +596,7 @@ def revoke_role_access(d: dict):
 
 @app.get("/roles")
 def list_roles():
+    """Liste tous les roles avec leurs habilitations actuelles."""
     conn = get_db()
     roles = conn.execute("SELECT id_role, titre_role, pilier_rattachement FROM Roles_Equipage").fetchall()
     result = []
@@ -593,6 +617,8 @@ def list_roles():
 
 @app.get("/profile/{badge}/history")
 def get_bpm_history(badge: str):
+    """Historique recent du BPM d'un badge, pour tracer la courbe dans la
+    fiche de profil du dashboard."""
     return {"badge": badge, "history": list(bpm_history.get(badge, []))}
 
 
@@ -610,8 +636,13 @@ def get_logs(limit: int = 20):
     return {"logs": [dict(r) for r in rows]}
 
 
+# --- Mode sauvetage : verifie qu'une salle est vide avant de sceller un sas -
+
 @app.post("/rescue/{zone}")
 def rescue(zone: str):
+    """En cas d'incident (incendie, depressurisation...), verifie qui se
+    trouve encore dans la salle avant d'autoriser le scellement du sas.
+    Utilise le dernier etat connu (positions du dernier snapshot)."""
     if zone not in ZONES:
         return {"error": f"Salle inconnue. Salles valides : {list(ZONES.keys())}"}
     people = snapshot()
@@ -619,13 +650,20 @@ def rescue(zone: str):
     return {"zone": zone, "trapped": trapped, "can_seal": len(trapped) == 0}
 
 
+# --- Mode test sans BLE : placer un badge dans une salle a la main ---------
+
 @app.get("/test/rooms")
 def test_rooms():
+    """Liste des salles utilisables pour le test manuel."""
     return {"rooms": list(ZONES.keys())}
 
 
 @app.post("/test/move")
 def test_move(d: dict):
+    """Place un badge directement dans une salle, sans RSSI/BLE.
+    Payload : {"badge": "ASTRA-001", "room": "Laboratoire"}
+    "badge" peut etre n'importe quel id (ASTRA-001/002/003 pour un profil
+    connu, ou autre chose type "INTRUS-01" pour tester un badge inconnu)."""
     badge = d["badge"]
     room = d["room"]
     if room not in ZONES:
@@ -638,6 +676,9 @@ def test_move(d: dict):
 
 @app.post("/test/set-position")
 def test_set_position(d: dict):
+    """Place un badge a des coordonnees precises (en metres), pour le
+    deplacement libre au clavier (ZQSD) cote frontend.
+    Payload : {"badge": "ASTRA-001", "x": 7.2, "y": 3.9}"""
     badge = d["badge"]
     x = round(max(0.3, min(float(d["x"]), ROOM_WIDTH_M_SERVER - 0.3)), 2)
     y = round(max(0.3, min(float(d["y"]), ROOM_HEIGHT_M_SERVER - 0.3)), 2)
@@ -647,6 +688,7 @@ def test_set_position(d: dict):
 
 @app.post("/test/clear/{badge}")
 def test_clear(badge: str):
+    """Retire le placement manuel (reprend le suivi BLE reel s'il y en a un)."""
     manual_overrides.pop(badge, None)
     return {"cleared": badge}
 
@@ -659,6 +701,8 @@ def test_clear_all():
 
 @app.post("/test/reset-bpm/{badge}")
 def reset_bpm(badge: str):
+    """Remet le BPM simule d'un badge a sa valeur de repos - utile si la
+    marche aleatoire a derive vers un extreme pendant un test prolonge."""
     baseline_bpm.pop(badge, None)
     current_bpm.pop(badge, None)
     prev_alert.pop(badge, None)
@@ -667,6 +711,9 @@ def reset_bpm(badge: str):
 
 @app.post("/test/stress/{badge}")
 def induce_stress(badge: str):
+    """Provoque un pic de stress simule (BPM eleve) pour demontrer le
+    declenchement d'alerte a la demande. Redescend naturellement vers la
+    valeur de repos au fil des ticks suivants (retour au calme progressif)."""
     bpm = random.uniform(125, 142)
     current_bpm[badge] = bpm
     return {"badge": badge, "bpm": round(bpm)}
@@ -674,5 +721,8 @@ def induce_stress(badge: str):
 
 @app.post("/test/simulate-jump/{badge}")
 def simulate_jump(badge: str):
+    """Force un 'saut de position suspect' a des fins de demonstration,
+    visible pendant 2,5 secondes sur le dashboard. Le badge doit deja etre
+    suivi (place via /test/move ou du vrai BLE)."""
     forced_anomaly[badge] = time.time() + 2.5
     return {"badge": badge, "forced_anomaly_until": "2.5s"}
